@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
+from typing import Any, Optional
 from uuid import uuid4
 
 import cv2
@@ -24,6 +26,12 @@ class DetectionService:
     La orquestacion (predict: deteccion -> recorte -> clasificacion -> JSON)
     ya esta provista.
     """
+
+    # El detector se carga una sola vez. Los jobs corren en paralelo (MAX_WORKERS) y el
+    # predictor de ultralytics guarda estado interno, por eso la carga y la inferencia se
+    # serializan con un lock.
+    _detector: Optional[Any] = None
+    _detector_lock = threading.Lock()
 
     def __init__(
         self,
@@ -75,7 +83,25 @@ class DetectionService:
 
         Retorna una lista de ((x1, y1, x2, y2), confidence) en pixeles.
         """
-        raise NotImplementedError("Etapa 3: implementar detect_dogs")
+        if image is None or image.ndim != 3 or image.size == 0:
+            raise ValueError("detect_dogs espera una imagen BGR (H, W, 3)")
+        height, width = image.shape[:2]
+
+        with DetectionService._detector_lock:
+            detector = self._get_detector()
+            # ultralytics interpreta los np.ndarray como BGR (convencion OpenCV): no se convierte.
+            # classes y conf filtran dentro del detector, antes del NMS.
+            result = detector.predict(
+                image, conf=self.conf_threshold, classes=[self.dog_class_id], verbose=False
+            )[0]
+
+        detections: list[tuple[tuple[int, int, int, int], float]] = []
+        for xyxy, confidence in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy()):
+            # Coordenadas en pixeles de la imagen original, recortadas a sus bordes.
+            box = self._clip_xyxy(*(int(round(float(v))) for v in xyxy), height, width)
+            detections.append((box, float(confidence)))
+        detections.sort(key=lambda detection: detection[1], reverse=True)
+        return detections
 
     def classify_detected_dog(self, crop: np.ndarray) -> tuple[str, float]:
         """
@@ -85,6 +111,24 @@ class DetectionService:
         El recorte llega en BGR (OpenCV). Retorna (raza, score).
         """
         raise NotImplementedError("Etapa 3: implementar classify_detected_dog")
+
+    # ------------------------------------------------------------------
+    # Helpers privados de la Etapa 3
+    # ------------------------------------------------------------------
+
+    def _get_detector(self) -> Any:
+        """YOLO preentrenado en COCO (YOLO_MODEL). Se llama con _detector_lock tomado.
+
+        Si el archivo de pesos no existe, ultralytics lo descarga en esa ruta en el primer uso.
+        """
+        if DetectionService._detector is None:
+            # Import lazy: bootstrap importa este modulo y en Colab (2-train.ipynb) ultralytics
+            # no esta instalado; solo se necesita al detectar.
+            from ultralytics import YOLO
+
+            DetectionService._detector = YOLO(self.yolo_model_name)
+            logger.info("Detector YOLO cargado: %s", self.yolo_model_name)
+        return DetectionService._detector
 
     # ------------------------------------------------------------------
     # Orquestacion provista

@@ -14,6 +14,7 @@ Dentro de Docker (con `docker compose up -d` corriendo):
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
 from pathlib import Path
@@ -40,7 +41,18 @@ def main() -> None:
     parser.add_argument(
         "--limit", type=int, default=0, help="Maximo de imagenes por raza (0 = todas)."
     )
+    parser.add_argument(
+        "--splits-csv",
+        default=str(ROOT / "data" / "processed" / "splits.csv"),
+        help="Splits de la Parte 1. Solo se indexan las imagenes de ese split. Vacio = toda la carpeta.",
+    )
     args = parser.parse_args()
+
+    allowed: set[str] | None = None
+    if args.splits_csv and Path(args.splits_csv).is_file():
+        with open(args.splits_csv, newline="", encoding="utf-8") as f:
+            allowed = {row["path"] for row in csv.DictReader(f) if row["split"] == args.split}
+        print(f"Usando {len(allowed)} imagenes de {args.split} de {args.splits_csv}")
 
     from lib.bootstrap import build_classifier, build_similarity, build_store
     from lib.config import settings
@@ -65,6 +77,8 @@ def main() -> None:
         count = 0
         for image_path in sorted(breed_dir.iterdir()):
             if image_path.suffix.lower() not in IMAGE_SUFFIXES:
+                continue
+            if allowed is not None and image_path.relative_to(settings.dataset_path).as_posix() not in allowed:
                 continue
             if args.limit and count >= args.limit:
                 break

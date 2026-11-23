@@ -16,8 +16,8 @@ def build_train_augmentation(image_size: int, seed: int | None = None) -> A.Comp
     """
     return A.Compose(
         [
-            # Recorte aleatorio + Resize a image_size, simula encuadres de los recortes de YOLO
-            A.RandomResizedCrop(size=(image_size, image_size), scale=(0.6, 1.0), ratio=(3 / 4, 4 / 3), p=1.0),
+            # Recorte aleatorio + leve estiramiento: robustez a encuadres parciales, escala y contextura del perro
+            A.RandomResizedCrop(size=(image_size, image_size), scale=(0.7, 1.0), ratio=(0.9, 1.1), p=1.0),
             # Flip horizontal
             A.HorizontalFlip(p=0.5),
             # Rotaciones
@@ -34,6 +34,8 @@ def build_train_augmentation(image_size: int, seed: int | None = None) -> A.Comp
             A.ImageCompression(quality_range=(45, 95), p=0.3),
             # Oclusiones parciales
             A.CoarseDropout(num_holes_range=(1, 2), hole_height_range=(0.10, 0.25), hole_width_range=(0.10, 0.25), fill=0, p=0.25),
+            # Conversión a gris con baja probabilidad
+            A.ToGray(p=0.05),
         ],
         seed=seed
     )

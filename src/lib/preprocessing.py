@@ -1,16 +1,21 @@
 """Preprocesamiento de imágenes.
 load_bgr -> bgr_to_rgb -> [augmentation, solo en train] -> resize_to_square -> normalize
-preprocess() encadena todos los pasos (sin augmentation) y es la función que usan los servicios.
+preprocess() encadena todos los pasos y es la función que usan los servicios (augment=False, por defecto)
+y el entrenamiento (augment=True).
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
+from functools import lru_cache
 from typing import Literal
 
+import albumentations as A
 import cv2
 import numpy as np
 import torch
+
+from lib.augmentation import build_train_augmentation
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +108,24 @@ def resize_to_square(image: np.ndarray, size: int, mode: ResizeMode = DEFAULT_RE
     return canvas
 
 
+@lru_cache(maxsize=None)
+def train_augmentation(size: int, seed: int | None = None) -> A.Compose:
+    """
+    Pipeline de data augmentation para el entrenamiento, definido en :mod:`lib.augmentation`.
+
+    Se construye una sola vez por combinación de ``size`` y ``seed`` (``lru_cache``) y se reutiliza en cada
+    llamada a :func:`preprocess`: si no, se volvería a armar para cada imagen de cada época.
+
+    Args:
+        size (int): Lado de la imagen de salida, en píxeles (``IMAGE_SIZE``).
+        seed (int | None): Semilla del pipeline, para que el entrenamiento sea reproducible.
+
+    Returns:
+        A.Compose: Pipeline de albumentations.
+    """
+    return build_train_augmentation(size, seed=seed)
+
+
 def normalize(image: np.ndarray) -> torch.Tensor:
     """
     Normaliza una imagen RGB uint8 con las estadísticas de ImageNet y la convierte en tensor CHW.
@@ -119,17 +142,22 @@ def normalize(image: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1)))
 
 
-def preprocess(image: np.ndarray, size: int, mode: ResizeMode = DEFAULT_RESIZE_MODE) -> torch.Tensor:
+def preprocess(image: np.ndarray, size: int, mode: ResizeMode = DEFAULT_RESIZE_MODE, augment: bool = False, seed: int | None = None) -> torch.Tensor:
     """
-    Preprocesamiento completo de inferencia: BGR -> RGB -> resize a ``size`` x ``size`` -> normalización.
+    Preprocesamiento completo: BGR -> RGB -> [augmentation] -> resize a ``size`` x ``size`` -> normalización.
 
-    Es la función que usan los servicios de la app y la evaluación en las notebooks. Devuelve un tensor sin
-    dimensión de batch: para pasarlo al modelo, usar ``preprocess(...).unsqueeze(0)``.
+    Es la función que usan los servicios de la app, la evaluación y el entrenamiento. El augmentation se
+    aplica antes del resize, sobre la imagen original: así, por ejemplo, una rotación gira la foto y no las
+    bandas del padding. Devuelve un tensor sin dimensión de batch: para pasarlo al modelo, usar
+    ``preprocess(...).unsqueeze(0)``.
 
     Args:
         image (np.ndarray): Imagen BGR uint8 (como ``cv2.imread``), de forma (alto, ancho, 3).
         size (int): Lado de la imagen de salida, en píxeles (``IMAGE_SIZE``).
         mode (ResizeMode): ``"pad"`` (por defecto) o ``"stretch"``.
+        augment (bool): Si es ``True``, aplica :func:`train_augmentation`. Solo para imágenes de ``train``:
+            nunca en validación, test, el conjunto independiente ni la app.
+        seed (int | None): Semilla del augmentation (solo se usa con ``augment=True``).
 
     Returns:
         torch.Tensor: Tensor float32 de forma (3, size, size).
@@ -147,7 +175,10 @@ def preprocess(image: np.ndarray, size: int, mode: ResizeMode = DEFAULT_RESIZE_M
         raise ValueError(f"Se esperaba una imagen BGR de 3 canales, llegó una de forma {image.shape}")
     if image.dtype != np.uint8:
         raise ValueError(f"Se esperaba una imagen uint8, llegó {image.dtype}")
-    return normalize(resize_to_square(bgr_to_rgb(image), size, mode))
+    rgb = bgr_to_rgb(image)
+    if augment:
+        rgb = train_augmentation(size, seed)(image=rgb)["image"]
+    return normalize(resize_to_square(rgb, size, mode))
 
 
 def denormalize(tensor: torch.Tensor) -> np.ndarray:

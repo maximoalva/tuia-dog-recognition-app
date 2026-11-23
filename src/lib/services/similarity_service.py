@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional
 from uuid import uuid4
 
 import cv2
 import numpy as np
+import torch
+from torchvision import models
 
+from lib.preprocessing import preprocess
 from lib.schemas import EmbeddingRecord, Neighbor, SearchResult
 from lib.storage.base import EmbeddingStoreProtocol
 
@@ -26,6 +31,11 @@ class SimilarityService:
     La orquestacion (search, index_image, persistencia y metricas de similitud)
     ya esta provista y no debe modificarse sin justificarlo en el Pull Request.
     """
+
+    # Se carga una sola vez. El lock evita cargarlo dos veces con requests en paralelo.
+    _backbone: Optional[torch.nn.Module] = None
+    _backbone_lock = threading.Lock()
+    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def __init__(
         self,
@@ -72,7 +82,16 @@ class SimilarityService:
           - Recordar que la imagen llega en BGR (OpenCV).
         Retorna una lista de floats de dimension EMBEDDING_DIM.
         """
-        raise NotImplementedError("Etapa 1: implementar extract_embedding")
+        model = self._get_backbone()
+        # Mismo preprocesamiento que en el entrenamiento.
+        batch = preprocess(image, self.image_size).unsqueeze(0).to(self._device)
+        with torch.no_grad():
+            embedding = model(batch)[0].cpu().numpy()
+        # Normalizacion L2, asi el producto escalar es la similitud coseno.
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+        return embedding.astype(float).tolist()
 
     def search_similar_images(self, embedding: list[float], top_k: int) -> list[Neighbor]:
         """
@@ -85,7 +104,22 @@ class SimilarityService:
         Retorna una lista de Neighbor (path, breed, score) ordenada por score
         descendente.
         """
-        raise NotImplementedError("Etapa 1: implementar search_similar_images")
+        if top_k <= 0:
+            return []
+        store_search = getattr(self.store, "search", None)
+        if callable(store_search) and self.similarity_metric.lower() == "cosine":
+            # pgvector resuelve el top-k en la base.
+            candidates = store_search(embedding, top_k)
+        else:
+            # store.search solo ordena por coseno, con l2 (o con JSON) se recorre todo.
+            candidates = self.store.all()
+
+        neighbors = [
+            Neighbor(path=record.path, breed=record.breed, score=self.similarity(embedding, record.embedding))
+            for record in candidates
+        ]
+        neighbors.sort(key=lambda neighbor: neighbor.score, reverse=True)
+        return neighbors[:top_k]
 
     def predict_breed_from_neighbors(self, results: list[Neighbor]) -> tuple[str, float]:
         """
@@ -94,8 +128,40 @@ class SimilarityService:
 
         Si el mejor score esta por debajo de self.similarity_threshold se
         considera "unknown". Retorna (raza, score).
+
+        Voto ponderado, cada vecino suma su score a su raza. En empate gana la del vecino mas
+        parecido. Devuelve el score medio de la raza ganadora.
         """
-        raise NotImplementedError("Etapa 1: implementar predict_breed_from_neighbors")
+        if not results:
+            return "unknown", 0.0
+        best_score = max(neighbor.score for neighbor in results)
+        if best_score < self.similarity_threshold:
+            return "unknown", best_score
+
+        scores_by_breed: dict[str, list[float]] = defaultdict(list)
+        for neighbor in results:
+            scores_by_breed[neighbor.breed].append(neighbor.score)
+        breed, scores = max(scores_by_breed.items(), key=lambda item: (sum(item[1]), max(item[1])))
+        return breed, float(np.mean(scores))
+
+    # ------------------------------------------------------------------
+    # Helpers privados de la Etapa 1
+    # ------------------------------------------------------------------
+
+    def _get_backbone(self) -> torch.nn.Module:
+        """ResNet18 preentrenada en ImageNet sin la capa de clasificacion (embedding de 512).
+
+        Es la misma red que el Modelo A y es mas liviana que ResNet50.
+        """
+        if SimilarityService._backbone is None:
+            with SimilarityService._backbone_lock:
+                if SimilarityService._backbone is None:
+                    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+                    model.fc = torch.nn.Identity()
+                    model.eval().to(self._device)
+                    SimilarityService._backbone = model
+                    logger.info("Baseline ResNet18 (ImageNet) cargado en %s", self._device)
+        return SimilarityService._backbone
 
     # ------------------------------------------------------------------
     # Helpers de similitud provistos

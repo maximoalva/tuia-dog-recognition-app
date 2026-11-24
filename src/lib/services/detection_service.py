@@ -9,7 +9,9 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
+import torch
 
+from lib.preprocessing import preprocess
 from lib.schemas import ClassifyResult, DetectResult, DogDetection
 from lib.services.classifier_service import ClassifierService
 
@@ -26,10 +28,8 @@ class DetectionService:
     La orquestacion (predict: deteccion -> recorte -> clasificacion -> JSON)
     ya esta provista.
     """
-
-    # El detector se carga una sola vez. Los jobs corren en paralelo (MAX_WORKERS) y el
-    # predictor de ultralytics guarda estado interno, por eso la carga y la inferencia se
-    # serializan con un lock.
+    # El detector se carga una sola vez. Los jobs corren en paralelo (MAX_WORKERS) y el predictor de ultralytics guarda estado interno,
+    # por eso la carga y la inferencia se serializan con un lock.
     _detector: Optional[Any] = None
     _detector_lock = threading.Lock()
 
@@ -89,11 +89,8 @@ class DetectionService:
 
         with DetectionService._detector_lock:
             detector = self._get_detector()
-            # ultralytics interpreta los np.ndarray como BGR (convencion OpenCV): no se convierte.
             # classes y conf filtran dentro del detector, antes del NMS.
-            result = detector.predict(
-                image, conf=self.conf_threshold, classes=[self.dog_class_id], verbose=False
-            )[0]
+            result = detector.predict(image, conf=self.conf_threshold, classes=[self.dog_class_id], verbose=False)[0]
 
         detections: list[tuple[tuple[int, int, int, int], float]] = []
         for xyxy, confidence in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy()):
@@ -101,7 +98,7 @@ class DetectionService:
             box = self._clip_xyxy(*(int(round(float(v))) for v in xyxy), height, width)
             detections.append((box, float(confidence)))
         detections.sort(key=lambda detection: detection[1], reverse=True)
-        return detections
+        return self._remove_nested_boxes(detections, self.NESTED_BOX_THRESHOLD)
 
     def classify_detected_dog(self, crop: np.ndarray) -> tuple[str, float]:
         """
@@ -110,11 +107,93 @@ class DetectionService:
 
         El recorte llega en BGR (OpenCV). Retorna (raza, score).
         """
-        raise NotImplementedError("Etapa 3: implementar classify_detected_dog")
+        # Mismo preprocesamiento que en el entrenamiento.
+        tensor = preprocess(crop, self.classifier.image_size).unsqueeze(0)
+        model = self.classifier.load_model()
+        logits = self._predict_logits(model, tensor)[0]
+
+        # Softmax estable (se resta el máximo para evitar overflow en exp).
+        exp = np.exp(logits - logits.max())
+        probs = exp / exp.sum()
+        index = int(probs.argmax())
+
+        classes = self._get_classes(model)
+        if len(classes) != len(probs):
+            raise ValueError(
+                f"El modelo tiene {len(probs)} salidas pero la lista de razas tiene {len(classes)}"
+            )
+        return classes[index], float(probs[index])
 
     # ------------------------------------------------------------------
-    # Helpers privados de la Etapa 3
+    # Helpers privados
     # ------------------------------------------------------------------
+
+    # Una caja se descarta si al menos esta fracción de su área queda dentro de otra caja de perro más confiable.
+    NESTED_BOX_THRESHOLD = 0.85
+
+    @staticmethod
+    def _remove_nested_boxes(
+        detections: list[tuple[tuple[int, int, int, int], float]], threshold: float) -> list[tuple[tuple[int, int, int, int], float]]:
+        """Descarta las cajas que quedan casi enteras dentro de otra caja más confiable.
+
+        Recibe las detecciones ordenadas por confianza descendente y conserva ese orden.
+        """
+        kept: list[tuple[tuple[int, int, int, int], float]] = []
+        for box, confidence in detections:
+            x1, y1, x2, y2 = box
+            area = max(1, (x2 - x1) * (y2 - y1))
+            nested = False
+            for (kx1, ky1, kx2, ky2), _ in kept:
+                inter_w = max(0, min(x2, kx2) - max(x1, kx1))
+                inter_h = max(0, min(y2, ky2) - max(y1, ky1))
+                if inter_w * inter_h / area >= threshold:
+                    nested = True
+                    break
+            if not nested:
+                kept.append((box, confidence))
+        return kept
+
+    def _get_classes(self, model: Any) -> list[str]:
+        """Lista de razas en el orden de las salidas del modelo activo.
+
+        Se busca, en orden: el atributo ``classes`` del modelo (.pth), la metadata ``classes`` del ONNX
+        (JSON) y, si el modelo no la trae, ``data/processed/classes.json`` (generado en
+        1-pre-processing.ipynb, sección 9). Se cachea por modelo.
+        """
+        key = self.classifier.active_model_name
+        if key in self._classes_cache:
+            return self._classes_cache[key]
+
+        classes = getattr(model, "classes", None)
+        if classes is None and hasattr(model, "get_modelmeta"):  # onnxruntime.InferenceSession
+            raw = model.get_modelmeta().custom_metadata_map.get("classes")
+            classes = json.loads(raw) if raw else None
+        if classes is None:
+            from lib.config import settings
+
+            classes_path = Path(settings.data_path) / "processed" / "classes.json"
+            if not classes_path.exists():
+                raise ValueError(
+                    f"El modelo '{key}' no trae la lista de razas y no existe {classes_path}"
+                )
+            classes = json.loads(classes_path.read_text(encoding="utf-8"))
+            logger.warning("El modelo '%s' no trae la lista de razas: se usa %s", key, classes_path)
+
+        self._classes_cache[key] = list(classes)
+        return self._classes_cache[key]
+
+    def _predict_logits(self, model: Any, tensor: torch.Tensor) -> np.ndarray:
+        """Corre el modelo (.pth u .onnx) sobre un batch y devuelve los logits como array (batch, clases)."""
+        if hasattr(model, "get_inputs"):  # onnxruntime.InferenceSession
+            input_name = model.get_inputs()[0].name
+            outputs = model.run(None, {input_name: tensor.numpy()})
+            return np.asarray(outputs[0])
+        model.eval()
+        with torch.no_grad():
+            output = model(tensor)
+        if isinstance(output, (tuple, list)): # por si el forward devuelve (logits, embedding)
+            output = output[0]
+        return output.detach().cpu().numpy()
 
     def _get_detector(self) -> Any:
         """YOLO preentrenado en COCO (YOLO_MODEL). Se llama con _detector_lock tomado.
@@ -122,8 +201,6 @@ class DetectionService:
         Si el archivo de pesos no existe, ultralytics lo descarga en esa ruta en el primer uso.
         """
         if DetectionService._detector is None:
-            # Import lazy: bootstrap importa este modulo y en Colab (2-train.ipynb) ultralytics
-            # no esta instalado; solo se necesita al detectar.
             from ultralytics import YOLO
 
             DetectionService._detector = YOLO(self.yolo_model_name)

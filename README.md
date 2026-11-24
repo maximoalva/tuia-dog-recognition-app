@@ -315,12 +315,85 @@ Se pueden entregar commiteadas en el repositorio o en Google Colab, con el link 
 
 ## Dataset
 
-Documentar en la entrega final:
+El análisis completo está en [`1-pre-processing.ipynb`](1-pre-processing.ipynb). Los splits finales quedan en `data/processed/splits.csv` (ruta, raza, split e índice de clase) y la lista de razas, en el orden de esos índices, en `data/processed/classes.json`.
 
-- Splits utilizados y cantidad de imágenes por raza en cada uno
-- Reglas de filtrado y calidad, con la cantidad de imágenes descartadas por regla
-- Conjunto independiente de evaluación: fuente, licencia, razas e imágenes por raza, y link de descarga
-- Preprocesamiento y data augmentation aplicados
+### Splits
+
+Se usan los **splits originales del dataset** (*70 Dog Breeds Image Dataset*, Kaggle), con el filtrado de calidad aplicado a `train`.
+
+| Split | Imágenes | Razas | Imágenes por raza (mín–máx) | Media por raza |
+|---|---|---|---|---|
+| `train` | 7539 | 70 | 61–187 | 107,7 |
+| `valid` | 686 | 70 | 8–10 | 9,8 |
+| `test` | 700 | 70 | 10–10 | 10,0 |
+| **Total** | **8925** | 70 | | |
+
+Antes del filtrado, `train` tenía 7946 imágenes (entre 65 y 198 por raza), y `valid` y `test`, 700 cada uno. El desbalance de `train` es moderado y se mantiene después del filtrado. `test` no se modifica para que la evaluación sea comparable con el dataset original.
+
+**Corrección de etiquetas:** la raza *American Spaniel* figura como `American  Spaniel` (con dos espacios) en `valid`, lo que generaba 71 etiquetas en lugar de 70. Se corrige renombrando las carpetas (`normalize_breed_folders`, en `src/lib/dataset.py`), se aplica tras descargar el dataset.
+
+### Reglas de filtrado y calidad
+
+Las reglas de calidad se aplican **solo a `train`**: `valid` y `test` se conservan completos para que la evaluación refleje imágenes reales.
+
+| Regla | Criterio | Imágenes descartadas |
+|---|---|---|
+| Archivos corruptos | La imagen no se puede decodificar completa | 0 |
+| Baja resolución | Ancho o alto menor a 64 px | 0 |
+| Exposición extrema | Brillo medio menor a 10 o mayor a 245 | 0 |
+| Imágenes borrosas | Varianza del Laplaciano menor a 25,6 | 3 |
+| Duplicados y casi-duplicados | Hash perceptual (pHash) a distancia de Hamming ≤ 8 bits | 391 |
+| Etiqueta contradictoria | La misma foto en dos razas distintas (revisión manual) | 15 |
+| Exclusión manual | No es un perro real (una remera estampada) | 1 |
+| **Total** | Una imagen puede incumplir más de una regla | **407** |
+
+Además, se descartaron de `valid` **14 imágenes** que tenían una copia en `test`, para que no haya fuga de datos entre `valid` y `test`.
+
+Hallazgos principales:
+- **Fuga de datos entre splits:** el **9,4 %** de `valid` y el **9,7 %** de `test` tenían una copia en `train`. Se descartan las copias de `train`; después del filtrado no queda ninguna imagen repetida entre splits.
+- **Ruido de etiquetas:** 12 pares de copias aparecen con dos razas distintas, casi todos entre razas muy parecidas (*American Spaniel* / *Irish Spaniel*, *Lhasa* / *Shih-Tzu*, *Cockapoo* / *Labradoodle*).
+- **Umbrales elegidos mirando ejemplos:** el brillo y la nitidez dependen del color y del tipo de pelo de cada raza, así que umbrales más estrictos habrían eliminado perros bien fotografiados de razas oscuras, blancas o de pelo esponjoso.
+
+### Conjunto independiente de evaluación
+
+- **Fuente:** fotos propias, aportadas por los dueños de los perros. Se pidieron solo perros de raza, para que la etiqueta sea confiable, y ninguna foto muestra personas identificables.
+- **Licencia:** los dueños dieron su consentimiento para usarlas en este trabajo académico y su exposición. No se suben al repositorio.
+- **Link de descarga (solo lectura):** [link]
+- **Estructura:** `data/dataset/independent/`, con una carpeta por raza, más `_Escenas/` (varios perros, o un perro con otros animales u objetos) y `_Sin perros/` (por ejemplo, gatos).
+
+| Tipo | Imágenes |
+|---|---|
+| Un perro | 48 |
+| Escenas | 3 |
+| Sin perros | 1 |
+| **Total** | **52** |
+
+Las fotos cubren **7 razas**. El 87 % de las fotos son verticales (sacadas con el celular) y ninguna es cuadrada, a diferencia del dataset (todas de 224×224): es el cambio de dominio que este conjunto permite medir.
+
+### Preprocesamiento y data augmentation
+
+El preprocesamiento está en `src/lib/preprocessing.py` y lo usan tanto las notebooks como los servicios de la app (`preprocess(image, size, augment=False)`), para que el modelo reciba lo mismo al entrenar y en producción:
+
+1. **Orden de canales:** la app entrega imágenes **BGR** (OpenCV), que se convierten a **RGB**. El entrenamiento también lee las imágenes con OpenCV, así que hay un solo camino.
+2. **Resize con padding** a `IMAGE_SIZE` × `IMAGE_SIZE` (224): se respeta la proporción y se rellena con el color medio de ImageNet, que después de normalizar vale prácticamente 0. Se eligió frente al resize directo, que deforma al perro en fotos verticales o recortes alargados de YOLO.
+3. **Normalización con las estadísticas de ImageNet** para todos los modelos, incluida la CNN propia: las de `train` son muy parecidas (diferencias menores a 0,05).
+
+El **data augmentation** está en `src/lib/augmentation.py` y se aplica **solo a `train`**, antes del resize y con seed fija:
+
+| Transformación | Parámetros | Prob. |
+|---|---|---|
+| Recorte aleatorio | 70–100 % del área, relación de aspecto 0,9–1,1 | 1 |
+| Flip horizontal | — | 0,5 |
+| Rotación | ±15°, bordes en espejo | 0,6 |
+| Blur gaussiano o de movimiento | kernel de 3–5 / 3–7 px | 0,2 |
+| Brillo y contraste | ±25 % | 0,6 |
+| Saturación y valor (sin cambio de tono) | ±15 / ±10 | 0,3 |
+| Ruido gaussiano | desvío del 1–5 % | 0,2 |
+| Compresión JPEG | calidad 45–95 | 0,3 |
+| Oclusiones | 1–2 rectángulos de 10–25 % del lado | 0,25 |
+| Escala de grises | — | 0,05 |
+
+No se aplican flips verticales, rotaciones grandes, cambios de tono ni deformaciones fuertes, porque no ocurren en fotos reales o alteran rasgos que distinguen a las razas (el color del pelaje y las proporciones del cuerpo).
 
 ## Modelos y entrenamiento
 

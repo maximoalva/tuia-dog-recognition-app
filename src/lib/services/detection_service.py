@@ -44,6 +44,7 @@ class DetectionService:
         self.yolo_model_name = yolo_model
         self.conf_threshold = conf_threshold
         self.dog_class_id = dog_class_id
+        self._classes_cache: dict[str, list[str]] = {}
 
     @staticmethod
     def _clip_xyxy(

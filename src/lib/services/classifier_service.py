@@ -116,7 +116,7 @@ class ClassifierService:
         history_file.write_text(json.dumps(record, indent=2), encoding="utf-8")
         # El checkpoint cambio, la proxima carga tiene que leer el nuevo.
         self._loaded.pop(self.active_model_name, None)
-        logger.info("Checkpoint en %s, historial en %s", checkpoint, history_file)
+        logger.info("Se guardaron %s y %s", checkpoint.name, history_file.name)
 
     def evaluate_classifier(self) -> dict[str, float]:
         """

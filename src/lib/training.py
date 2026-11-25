@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset, get_worker_info
 from torchvision import models
 
 from lib.evaluation.metrics import precision_recall_f1, specificity
+from lib.models.cnn_custom import CNNCustom
 from lib.preprocessing import load_bgr, preprocess
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,8 @@ logger = logging.getLogger(__name__)
 class TrainConfig:
     """Hiperparametros de un entrenamiento."""
 
-    strategy: str = "finetune"  # finetune (toda la red) o frozen (solo la ultima capa)
+    strategy: str = "finetune"  # ResNet con finetune (toda la red) o frozen (solo la ultima capa), CNN propia con scratch
+    augment: bool = True
     epochs: int = 30
     batch_size: int = 64
     lr_head: float = 1e-3
@@ -43,10 +45,17 @@ class TrainConfig:
     num_workers: int = 4
     seed: int = 42
     checkpoint: Path | None = None  # None guarda en el checkpoint del modelo activo
+    # Arquitectura de la CNN propia (solo cnn_custom)
+    channels: tuple[int, ...] = (32, 64, 128, 256)
+    convs_per_block: int = 1
+    embedding_dim: int = 512
+    dropout: float = 0.3
 
 
 TRAIN_CONFIGS: dict[str, TrainConfig] = {
     "resnet18_finetuned": TrainConfig(),
+    # Desde cero todas las capas arrancan igual, asi que van con el mismo learning rate.
+    "cnn_custom": TrainConfig(strategy="scratch", epochs=50, lr_backbone=1e-3, lr_patience=3, early_stopping=8),
 }
 
 
@@ -99,18 +108,21 @@ def make_loader(dataset: BreedDataset, batch_size: int, shuffle: bool, num_worke
     )
 
 
-def build_model(name: str, num_classes: int, strategy: str) -> nn.Module:
+def build_model(name: str, num_classes: int, config: TrainConfig) -> nn.Module:
     """Modelo nuevo listo para entrenar."""
-    if name == "resnet18_finetuned":
-        model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
-    else:
+    if name == "cnn_custom":
+        if config.strategy != "scratch":
+            raise ValueError("La CNN propia se entrena desde cero (strategy='scratch')")
+        return CNNCustom(num_classes, config.channels, config.convs_per_block, config.embedding_dim, config.dropout)
+    if name != "resnet18_finetuned":
         raise ValueError(f"No hay receta de entrenamiento para '{name}'")
-    if strategy == "frozen":
+    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    if config.strategy == "frozen":
         for param_name, param in model.named_parameters():
             param.requires_grad = param_name.startswith("fc.")
-    elif strategy != "finetune":
-        raise ValueError(f"Estrategia desconocida '{strategy}' (usar finetune o frozen)")
+    elif config.strategy != "finetune":
+        raise ValueError(f"Estrategia desconocida '{config.strategy}' (usar finetune o frozen)")
     return model
 
 
@@ -154,12 +166,12 @@ def train_model(name: str, config: TrainConfig, dataset_path: Path, image_size: 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     splits, classes = load_splits(dataset_path)
-    train_ds = BreedDataset(dataset_path, splits[splits["split"] == "train"], image_size, augment=True)
+    train_ds = BreedDataset(dataset_path, splits[splits["split"] == "train"], image_size, augment=config.augment)
     valid_ds = BreedDataset(dataset_path, splits[splits["split"] == "valid"], image_size)
     train_loader = make_loader(train_ds, config.batch_size, True, config.num_workers, config.seed)
     valid_loader = make_loader(valid_ds, config.batch_size, False, config.num_workers, config.seed)
 
-    model = build_model(name, len(classes), config.strategy).to(device)
+    model = build_model(name, len(classes), config).to(device)
     head = [p for n, p in model.named_parameters() if n.startswith("fc.")]
     backbone = [p for n, p in model.named_parameters() if not n.startswith("fc.") and p.requires_grad]
     groups = [{"params": head, "lr": config.lr_head}]

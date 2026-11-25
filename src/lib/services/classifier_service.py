@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import onnxruntime
+
+from lib.preprocessing import preprocess
+from lib.training import TRAIN_CONFIGS, classification_metrics, embed, load_splits, predict, train_model
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +100,23 @@ class ClassifierService:
           - Aplicar el preprocesamiento y data augmentation justificados.
           - Guardar el checkpoint resultante en self.active_checkpoint
             (ej: models/resnet18_finetuned.pth).
+
+        Los hiperparametros salen de TRAIN_CONFIGS (lib/training.py). El historial por epoca
+        queda en output/history_<checkpoint>.json para graficar las curvas en la notebook.
         """
-        raise NotImplementedError("Etapa 2: implementar train_classifier")
+        config = TRAIN_CONFIGS[self.active_model_name]
+        checkpoint = Path(config.checkpoint) if config.checkpoint else self.active_checkpoint
+        history = train_model(self.active_model_name, config, self.dataset_path, self.image_size, checkpoint)
+
+        self.output_path.mkdir(parents=True, exist_ok=True)
+        record = {"model": self.active_model_name, "checkpoint": str(checkpoint),
+                  "config": {k: str(v) if isinstance(v, Path) else v for k, v in asdict(config).items()},
+                  "history": history}
+        history_file = self.output_path / f"history_{checkpoint.stem}.json"
+        history_file.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        # El checkpoint cambio, la proxima carga tiene que leer el nuevo.
+        self._loaded.pop(self.active_model_name, None)
+        logger.info("Checkpoint en %s, historial en %s", checkpoint, history_file)
 
     def evaluate_classifier(self) -> dict[str, float]:
         """
@@ -109,8 +129,17 @@ class ClassifierService:
         Retorna un dict con las metricas, ej:
           {"accuracy": 0.91, "precision": 0.90, "recall": 0.89,
            "specificity": 0.99, "f1": 0.90}
+
+        Precision, recall, specificity y F1 son macro, se calculan por raza (one-vs-rest)
+        y se promedian, asi cada raza pesa lo mismo.
         """
-        raise NotImplementedError("Etapa 2: implementar evaluate_classifier")
+        model = self.load_model()
+        splits, classes = load_splits(self.dataset_path)
+        test = splits[splits["split"] == "test"]
+        logits = predict(model, self.dataset_path, test, self.image_size)
+        metrics = classification_metrics(test["label"].to_numpy(), logits.argmax(1), len(classes))
+        logger.info("Test de %s: %s", self.active_model_name, {k: round(v, 4) for k, v in metrics.items()})
+        return metrics
 
     def extract_custom_embedding(self, image: np.ndarray) -> list[float]:
         """
@@ -122,4 +151,12 @@ class ClassifierService:
         La imagen llega en BGR (OpenCV). Retorna una lista de floats de
         dimension EMBEDDING_DIM.
         """
-        raise NotImplementedError("Etapa 2: implementar extract_custom_embedding")
+        model = self.load_model()
+        batch = preprocess(image, self.image_size).unsqueeze(0)
+        with torch.no_grad():
+            embedding = embed(model.eval(), batch)[0].numpy()
+        # Normalizacion L2, igual que el baseline.
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+        return embedding.astype(float).tolist()

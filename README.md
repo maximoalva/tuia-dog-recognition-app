@@ -475,7 +475,7 @@ Se guardan como modelo completo (`torch.save(model)`), con la lista de razas en 
 
 **YOLO11n** preentrenado en COCO (clase `dog` = 16), sin entrenar. Lo elegimos frente a YOLOv8n en `1-pre-processing.ipynb` (sección 4.7): sobre las imágenes del dataset, las que quedan sin perro detectado bajan de 44,7 % a 31,6 %, con una latencia en CPU del mismo orden y menos parámetros (2,6 M contra 3,2 M).
 
-`YOLO_CONF_THRESHOLD`: **0,25**. **[Pendiente: justificar con la comparación de 2 o 3 umbrales.]**
+`YOLO_CONF_THRESHOLD`: **0,25**. Probamos 0,10, 0,25, 0,50 y 0,70 con `detect_dogs` sobre 15 fotos: las escenas y las fotos sin perros del conjunto independiente, una foto de un perro y dos imágenes de ejemplo de Ultralytics con personas y objetos. Ningún umbral dio falsos positivos. Con 0,50 se pierde 1 de los 11 perros, y con 0,70, 3. Elegimos 0,25, el valor más alto que detecta todos los perros: el más difícil, un perro oscuro y cortado junto a un gato, sale con 0,28. Con ese umbral, YOLO encuentra el perro en 119 de las 124 fotos de un perro del conjunto independiente (`2-train.ipynb`, sección 6.1). La tabla y las imágenes están en el PR.
 
 ### Umbral de similitud (Etapa 1)
 

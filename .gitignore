@@ -14,5 +14,9 @@ models/*
 *.engine
 data/dataset/*
 !data/dataset/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+!data/processed/splits.csv
+!data/processed/classes.json
 runs/
 .DS_Store

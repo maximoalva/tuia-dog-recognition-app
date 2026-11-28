@@ -43,6 +43,12 @@ def main() -> None:
         else:
             shutil.copy2(item, target)
 
+    # El dataset tiene nombres de raza inconsistentes entre splits ("American  Spaniel" con dos espacios en valid/)
+    # Se normalizan las carpetas
+    sys.path.insert(0, str(ROOT / "src"))
+    from lib.dataset import normalize_breed_folders
+    normalize_breed_folders(DEST)
+
     print(f"Dataset disponible en {DEST}")
 
 
